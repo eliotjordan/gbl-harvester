@@ -27,6 +27,8 @@ import codecs
 
 import string
 
+import random
+
 import re
 
 from storage_exceptions import *
@@ -36,6 +38,12 @@ from pairtree_object import PairtreeStorageObject
 import pairtree_path as ppath
 
 import hashlib
+
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+logger = logging.getLogger('pairtreeclient')
 
 class PairtreeStorageClient(object):
     """A client that oversees the implementation of the Pairtree FS specification
@@ -95,11 +103,6 @@ class PairtreeStorageClient(object):
 
     def __hex2char(self, m):
         return ppath.hex2char(m)
-
-    def _rm_uribase(self, id):
-        if id.startswith(self.uri_base):
-            return id[len(self.uri_base):]
-        return id
 
     def id_encode(self, id):
         """
@@ -203,9 +206,8 @@ class PairtreeStorageClient(object):
         @type id: identifier
         @returns: A directory path to the object's root directory
         """
-        
 #        return os.sep.join(self._id_to_dir_list(id))
-        return ppath.id_to_dirpath(self._rm_uribase(id), self.pairtree_root, self.shorty_length)
+        return ppath.id_to_dirpath(id, self.pairtree_root, self.shorty_length)
 
     def _id_to_dir_list(self, id):
         """
@@ -224,7 +226,7 @@ class PairtreeStorageClient(object):
 #            dirpath.append(enc_id[:self.shorty_length])
 #            enc_id = enc_id[self.shorty_length:]
 #        return dirpath
-        return ppath.id_to_dir_list(self._rm_uribase(id), self.pairtree_root, self.shorty_length)
+        return ppath.id_to_dir_list(id, self.pairtree_root, self.shorty_length)
         
     def _init_store(self):
         """
@@ -273,16 +275,21 @@ class PairtreeStorageClient(object):
         as long as non-shortie directorys are just that; non-shortie directories must
         have longer labels than the shorties - e.g::
 
-              ab -- cd -- ef -- obj -- foo.txt
+              ab -- cd -- ef -- foo.txt
                      |     |
                      |     ---- gh
                      |           |
-                     |           -- obj -- foo.txt
+                     |           ---- foo.txt
                      |
-                     ---- e -- obj -- foo.txt
+                     ---- e  -- foo.txt
 
               This method will return ['abcdef', 'abcde', 'abcdefgh'] as ids in this
               store.
+
+        TODO: Need to make sure this corresponds to pairtree spec.
+
+        Currently, it ignores the possibility of a split end being
+        'shielded' by a /obj/ folder
         
         Returns a generator, not a plain list since version 0.4.12
 
@@ -292,16 +299,14 @@ class PairtreeStorageClient(object):
         objects = set()
         paths = [os.path.join(self.pairtree_root, x) for x in os.listdir(self.pairtree_root) if os.path.isdir(os.path.join(self.pairtree_root, x))]
         d = None
-        terminator = ppath.get_terminator(self.shorty_length)
         if paths:
             d = paths.pop()
         while d:
             for t in os.listdir(d):
-                if t == terminator:
-                    potential_id = self._get_id_from_dirpath(os.path.join(d, terminator))
-                    if potential_id not in objects:
-                        objects.add(potential_id)
-                        yield potential_id
+                if len(t)>self.shorty_length:
+                    if self._get_id_from_dirpath(d) not in objects:
+                        objects.add(self._get_id_from_dirpath(d))
+                        yield self._get_id_from_dirpath(d)
                 elif os.path.isdir(os.path.join(d, t)):
                     paths.append(os.path.join(d, t))
             if paths:
@@ -318,13 +323,12 @@ class PairtreeStorageClient(object):
         @type id: identifier
         @returns: L{PairtreeStorageObject}
         """
-        id = self._rm_uribase(id)
         dirpath = os.path.join(self._id_to_dirpath(id))
         if not os.path.exists(dirpath):
             os.makedirs(dirpath)
         else:
             raise ObjectAlreadyExistsException
-        return PairtreeStorageObject(id, self)
+        return PairtreeStorageObject(id, self, dirpath)
 
     def list_parts(self, id, path=None):
         """
@@ -349,8 +353,7 @@ class PairtreeStorageClient(object):
             dirpath = os.path.join(self._id_to_dirpath(id), path)
         if not os.path.exists(dirpath):
             raise ObjectNotFoundException
-        return os.listdir(dirpath)
-        #return [x for x in os.listdir(dirpath) if len(x)>self.shorty_length]
+        return [x for x in os.listdir(dirpath) if len(x)>self.shorty_length]
 
     def isfile(self, id, filepath):
         """
@@ -399,7 +402,7 @@ class PairtreeStorageClient(object):
         else:
             return False
 
-    def put_stream(self, id, path, stream_name, bytestream, buffer_size = 1024 * 64):
+    def put_stream(self, id, path, stream_name, bytestream, buffer_size = 1024 * 8):
         """
         Store a stream of bytes into a file within a pairtree object.
 
@@ -436,7 +439,7 @@ class PairtreeStorageClient(object):
                 except:
                     pass
                 if not buffer_size:
-                    buffer_size = 1024 * 64
+                    buffer_size = 1024 * 8
                 chunk = bytestream.read(buffer_size)
                 while chunk:
                     f.write(chunk)
@@ -477,24 +480,6 @@ class PairtreeStorageClient(object):
             file_path = os.path.join(self._id_to_dirpath(id), path, stream_name)
         f = open(file_path, "ab+")
         return f
-
-    def get_url(self, id, stream_name, path=None):
-        """
-        Returns a direct 'file:///...' URL for a given id and stream (with an optional path)
-
-        @param id: Identifier for the pairtree object to read from
-        @type id: identifier
-        @param path: (Optional) subdirectory path to the file location
-        @type path: Directory path
-        @param stream_name: Name of the file to point to
-        @type stream_name: filename
-        @returns: L{str} - eg "file:///opt/store/pairtree_root/..../foo.txt"
-        """
-        file_path = stream_name
-        if path:
-            file_path = os.path.join(path, stream_name)
-        url_prefix = ppath.id_to_url(self._rm_uribase(id), self.pairtree_root, self.shorty_length)
-        return os.sep.join((url_prefix, file_path))
 
     def get_stream(self, id, path, stream_name, streamable=False):
         """
@@ -572,14 +557,22 @@ class PairtreeStorageClient(object):
         if os.path.isfile(dirpath):
             os.remove(dirpath)
         else:
-            # It's a directory:
             all_parts = os.listdir(dirpath)
-            
+            deletable_parts = [x for x in all_parts if len(x)>self.shorty_length]
             if len(all_parts) == 0:
                 os.rmdir(dirpath)
             elif recursive:
-                # thankfully, terminators simplify this
-                shutil.rmtree(dirpath)
+                for item in deletable_parts:
+                    if os.path.isdir(os.path.join(dirpath, item)):
+                        shutil.rmtree(os.path.join(dirpath, item))
+                    else:
+                        os.remove(os.path.join(dirpath, item))
+                if len(all_parts) == len(deletable_parts):
+                    os.rmdir(dirpath)
+            elif len(deletable_parts) == 0:
+                # Directory not physically empty, but empty of parts
+                pass
+
             else:
                 raise PathIsNotEmptyException
 
@@ -664,10 +657,7 @@ class PairtreeStorageClient(object):
         if not id:
             id = self._get_new_id()
             return self._create(id)
-        
-        id = self._rm_uribase(id)
-             
-        if self.exists(id):
+        elif self.exists(id):
             return PairtreeStorageObject(id, self)
         elif create_if_doesnt_exist:
             return self._create(id)
